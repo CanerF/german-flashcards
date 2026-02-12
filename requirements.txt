@@ -1,0 +1,5 @@
+flet==0.80.5
+psycopg2==2.9.11
+bcrypt==5.0.0
+python-dotenv==1.2.1
+httpx==0.28.1
