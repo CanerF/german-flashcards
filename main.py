@@ -388,4 +388,23 @@ def main(page: ft.Page):
 
     page.add(ft.Stack([view_login, app_layout, view_admin, practice_view], expand=True))
 
-ft.run(main)
+if __name__ == "__main__":
+    # When deployed to Render (or other PaaS) the platform provides a PORT
+    # environment variable and requires binding to 0.0.0.0 so external
+    # clients can reach the server. Use that when available; otherwise
+    # fall back to ft.run() for local development.
+    try:
+        port = int(os.environ.get("PORT", 0))
+    except Exception:
+        port = 0
+
+    if port:
+        # Start Flet app listening on all interfaces on the provided port.
+        # ft.app provides a simple way to specify host/port for deployments.
+        try:
+            ft.app(target=main, host="0.0.0.0", port=port)
+        except Exception:
+            # If ft.app is not available in this flet version, fall back.
+            ft.run(main)
+    else:
+        ft.run(main)
