@@ -1,8 +1,11 @@
 import csv
+import io
+import asyncio
 import flet as ft
 import psycopg2
 import bcrypt
 import os
+import time
 from datetime import date, timedelta
 from dotenv import load_dotenv
 
@@ -15,8 +18,11 @@ def main(page: ft.Page):
     page.theme_mode = ft.ThemeMode.DARK
     page.bgcolor = "#0f172a"
     page.padding = 0
-    page.window_width = 900
-    page.window_height = 700
+
+    is_mobile_platform = page.platform in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS)
+    if not is_mobile_platform:
+        page.window_width = 900
+        page.window_height = 700
 
     # --- SUPABASE BAĞLANTISI (Secure Configuration) ---
     db_config = {
@@ -50,6 +56,21 @@ def main(page: ft.Page):
         page.add(ft.Text(error_msg, color="red", size=14))
         print(f"Error: {e}")
         return
+
+    def run_in_user_transaction(user_id, work):
+        prev_autocommit = conn.autocommit
+        conn.autocommit = False
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT set_config('app.current_user_id', %s, true)", (str(user_id),))
+            result = work()
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.autocommit = prev_autocommit
 
     # --- DB ŞEMA KURULUMU (Otomatik) ---
     with conn.cursor() as cursor:
@@ -119,17 +140,17 @@ def main(page: ft.Page):
                 print("⚠️ INITIAL_ADMIN_PASSWORD not set — admin user not created automatically.")
 
         if admin_user_id:
-            try:
-                cursor.execute("SELECT set_config('app.current_user_id', %s, false)", (str(admin_user_id),))
-                cursor.execute("""
-                    UPDATE cards
-                    SET interval_days = COALESCE(interval_days, 1),
-                        ease_factor = COALESCE(ease_factor, 2.5),
-                        repetitions = COALESCE(repetitions, 0),
-                        next_due = COALESCE(next_due, CURRENT_DATE);
-                """)
-            finally:
-                cursor.execute("SELECT set_config('app.current_user_id', '', false)")
+            def backfill_cards():
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE cards
+                        SET interval_days = COALESCE(interval_days, 1),
+                            ease_factor = COALESCE(ease_factor, 2.5),
+                            repetitions = COALESCE(repetitions, 0),
+                            next_due = COALESCE(next_due, CURRENT_DATE);
+                    """)
+
+            run_in_user_transaction(admin_user_id, backfill_cards)
         else:
             print("⚠️ Admin not available — skipped card schedule backfill.")
 
@@ -138,18 +159,27 @@ def main(page: ft.Page):
         if not cursor.fetchone():
             try:
                 print("📚 Creating Standard Deck on Cloud...")
-                # Create deck owned by admin user (or NULL if no admin exists)
-                cursor.execute("INSERT INTO decks (name, owner_id) VALUES ('Standard German Start', %s) RETURNING id", (admin_user_id,))
-                std_deck_id = cursor.fetchone()[0]
-                
-                initial_words = [
-                    ("Der Hund", "The Dog"), ("Die Katze", "The Cat"), ("Das Brot", "The Bread"),
-                    ("Das Wasser", "The Water"), ("Hallo", "Hello"), ("Tschüss", "Goodbye"),
-                    ("Danke", "Thank you"), ("Bitte", "Please")
-                ]
-                for front, back in initial_words:
-                    cursor.execute("INSERT INTO cards (deck_id, front, back) VALUES (%s, %s, %s)", (std_deck_id, front, back))
-                print("✅ Standard deck created successfully")
+                if not admin_user_id:
+                    print("⚠️ Admin user missing — skipped standard deck bootstrap.")
+                else:
+                    def create_standard_deck():
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "INSERT INTO decks (name, owner_id) VALUES ('Standard German Start', %s) RETURNING id",
+                                (admin_user_id,)
+                            )
+                            std_deck_id = cur.fetchone()[0]
+
+                            initial_words = [
+                                ("Der Hund", "The Dog"), ("Die Katze", "The Cat"), ("Das Brot", "The Bread"),
+                                ("Das Wasser", "The Water"), ("Hallo", "Hello"), ("Tschüss", "Goodbye"),
+                                ("Danke", "Thank you"), ("Bitte", "Please")
+                            ]
+                            for front, back in initial_words:
+                                cur.execute("INSERT INTO cards (deck_id, front, back) VALUES (%s, %s, %s)", (std_deck_id, front, back))
+
+                    run_in_user_transaction(admin_user_id, create_standard_deck)
+                    print("✅ Standard deck created successfully")
             except Exception as e:
                 print(f"⚠️ Could not create standard deck: {e}")
                 # Continue anyway - not critical for app to work
@@ -160,6 +190,7 @@ def main(page: ft.Page):
     current_deck_owner_id = None
     current_card = None
     is_showing_answer = False
+    current_tab_index = 0
 
     # --- UI REFERANSLARI ---
     shared_decks_list = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
@@ -365,8 +396,15 @@ def main(page: ft.Page):
         my_decks_list.controls.clear()
         options_owned = []
         with conn.cursor() as cur:
-            # Show shared decks (owner_id IS NULL) plus decks owned by current user
-            if current_user:
+            # Admins can see all decks. Normal users see shared + own decks.
+            if current_user and current_user.get('is_admin'):
+                cur.execute("""
+                    SELECT d.id, d.name, d.owner_id, COUNT(c.id)
+                    FROM decks d
+                    LEFT JOIN cards c ON d.id = c.deck_id
+                    GROUP BY d.id, d.name, d.owner_id ORDER BY d.id
+                """)
+            elif current_user:
                 cur.execute("""
                     SELECT d.id, d.name, d.owner_id, COUNT(c.id)
                     FROM decks d
@@ -383,6 +421,7 @@ def main(page: ft.Page):
                     GROUP BY d.id, d.name, d.owner_id ORDER BY d.id
                 """)
             rows = cur.fetchall()
+            print(f"[load_decks] user={current_user['username'] if current_user else None} admin={current_user.get('is_admin') if current_user else None} rows={len(rows)}")
             for deck_id, name, owner_id, count in rows:
                 if owner_id is None:
                     label = f"{name} (Shared)"
@@ -467,6 +506,16 @@ def main(page: ft.Page):
                 
                 target_list.controls.append(deck_card)
 
+        if not shared_decks_list.controls:
+            shared_decks_list.controls.append(
+                ft.Text("No shared/visible decks found.", color="#94a3b8", size=13)
+            )
+
+        if not my_decks_list.controls:
+            my_decks_list.controls.append(
+                ft.Text("No personal decks yet.", color="#94a3b8", size=13)
+            )
+
         # Populate dropdown with only decks owned by the user (for adding cards)
         deck_dropdown.options = options_owned
         if options_owned:
@@ -477,7 +526,7 @@ def main(page: ft.Page):
 
     # --- AUTH FONKSİYONLARI ---
     def login(e):
-        nonlocal current_user
+        nonlocal current_user, current_tab_index
         username = txt_username.value
         password = txt_password.value
         
@@ -502,9 +551,11 @@ def main(page: ft.Page):
                 view_login.visible = False
                 app_layout.visible = True
                 if current_user['is_admin']:
-                    btn_admin_panel.visible = True
+                    nav_admin_btn.visible = True
                 else:
-                    btn_admin_panel.visible = False
+                    nav_admin_btn.visible = False
+                current_tab_index = 0
+                update_nav_selection()
                 try:
                     with conn.cursor() as cur2:
                         cur2.execute("SELECT set_config('app.current_user_id', %s, false)", (str(current_user['id']),))
@@ -552,11 +603,14 @@ def main(page: ft.Page):
         page.update()
 
     def logout(e):
-        nonlocal current_user
+        nonlocal current_user, current_tab_index
         current_user = None
+        current_tab_index = 0
         app_layout.visible = False
         view_admin.visible = False
         view_login.visible = True
+        nav_admin_btn.visible = False
+        update_nav_selection()
         txt_username.value = ""
         txt_password.value = ""
         # Clear session var
@@ -714,6 +768,9 @@ def main(page: ft.Page):
         if not current_card:
             return False, "No card selected."
 
+        if not current_user:
+            return False, "Login required."
+
         interval_days = int(current_card["interval_days"])
         ease_factor = float(current_card["ease_factor"])
         repetitions = int(current_card["repetitions"])
@@ -741,18 +798,21 @@ def main(page: ft.Page):
         next_due = date.today() + timedelta(days=interval_days)
 
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE cards
-                    SET interval_days = %s,
-                        ease_factor = %s,
-                        repetitions = %s,
-                        next_due = %s
-                    WHERE id = %s
-                    """,
-                    (interval_days, ease_factor, repetitions, next_due, current_card["id"])
-                )
+            def save_schedule():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE cards
+                        SET interval_days = %s,
+                            ease_factor = %s,
+                            repetitions = %s,
+                            next_due = %s
+                        WHERE id = %s
+                        """,
+                        (interval_days, ease_factor, repetitions, next_due, current_card["id"])
+                    )
+
+            run_in_user_transaction(current_user["id"], save_schedule)
             return True, "Saved"
         except Exception as ex:
             return False, f"Could not update review: {ex}"
@@ -824,29 +884,36 @@ def main(page: ft.Page):
                 page.update()
                 return
 
-            # Check deck ownership: disallow adding to shared decks or other users' decks
-            with conn.cursor() as cur:
-                cur.execute("SELECT owner_id FROM decks WHERE id = %s", (deck_id,))
-                row = cur.fetchone()
-                if not row:
-                    page.snack_bar = ft.SnackBar(ft.Text("Selected deck not found."))
-                    page.snack_bar.open = True
-                    page.update()
-                    return
-                owner_id = row[0]
-                if owner_id is None:
-                    page.snack_bar = ft.SnackBar(ft.Text("Cannot add cards to the shared deck."))
-                    page.snack_bar.open = True
-                    page.update()
-                    return
-                if owner_id != current_user['id']:
-                    page.snack_bar = ft.SnackBar(ft.Text("You can only add cards to your own decks."))
-                    page.snack_bar.open = True
-                    page.update()
-                    return
+            try:
+                def add_card_write():
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT owner_id FROM decks WHERE id = %s", (deck_id,))
+                        row = cur.fetchone()
+                        if not row:
+                            raise ValueError("Selected deck not found.")
 
-                cur.execute("INSERT INTO cards (deck_id, front, back) VALUES (%s, %s, %s)", 
-                            (deck_id, txt_front.value, txt_back.value))
+                        owner_id = row[0]
+                        if owner_id is None:
+                            raise PermissionError("Cannot add cards to the shared deck.")
+                        if owner_id != current_user['id']:
+                            raise PermissionError("You can only add cards to your own decks.")
+
+                        cur.execute(
+                            "INSERT INTO cards (deck_id, front, back) VALUES (%s, %s, %s)",
+                            (deck_id, txt_front.value, txt_back.value)
+                        )
+
+                run_in_user_transaction(current_user["id"], add_card_write)
+            except (ValueError, PermissionError) as ex:
+                page.snack_bar = ft.SnackBar(ft.Text(str(ex)))
+                page.snack_bar.open = True
+                page.update()
+                return
+            except Exception as ex:
+                page.snack_bar = ft.SnackBar(ft.Text(f"Could not save card: {ex}"))
+                page.snack_bar.open = True
+                page.update()
+                return
 
             txt_front.value = ""
             txt_back.value = ""
@@ -857,17 +924,7 @@ def main(page: ft.Page):
             load_decks()
             page.update()
 
-    def read_cards_from_csv(file_path):
-        with open(file_path, "r", encoding="utf-8-sig", newline="") as f:
-            sample = f.read(4096)
-            f.seek(0)
-            try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
-            except Exception:
-                dialect = csv.excel
-            reader = csv.reader(f, dialect)
-            rows = [row for row in reader if row]
-
+    def parse_cards_from_rows(rows):
         if not rows:
             return [], None
 
@@ -895,6 +952,31 @@ def main(page: ft.Page):
 
         return cards, has_header
 
+    def read_cards_from_csv(file_path):
+        with open(file_path, "r", encoding="utf-8-sig", newline="") as f:
+            sample = f.read(4096)
+            f.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+            except Exception:
+                dialect = csv.excel
+            reader = csv.reader(f, dialect)
+            rows = [row for row in reader if row]
+
+        return parse_cards_from_rows(rows)
+
+    def read_cards_from_csv_text(csv_text):
+        text_stream = io.StringIO(csv_text)
+        sample = csv_text[:4096]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+        except Exception:
+            dialect = csv.excel
+        reader = csv.reader(text_stream, dialect)
+        rows = [row for row in reader if row]
+
+        return parse_cards_from_rows(rows)
+
     def import_shared_deck_cards(cards, has_header):
         if not current_user or not current_user.get("is_admin"):
             csv_status.value = "Admin login required to import shared decks."
@@ -918,38 +1000,37 @@ def main(page: ft.Page):
         inserted = 0
         skipped = 0
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT set_config('app.current_user_id', %s, false)", (str(current_user["id"]),))
-                cur.execute("SELECT id FROM decks WHERE name = %s AND owner_id IS NULL", (deck_name,))
-                deck_row = cur.fetchone()
-                if deck_row:
-                    deck_id = deck_row[0]
-                else:
-                    cur.execute(
-                        "INSERT INTO decks (name, owner_id) VALUES (%s, NULL) RETURNING id",
-                        (deck_name,)
-                    )
-                    deck_id = cur.fetchone()[0]
-
-            for front, back in cards:
+            def do_import_shared():
+                nonlocal inserted, skipped
                 with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO cards (deck_id, front, back)
-                        SELECT %s, %s, %s
-                        WHERE NOT EXISTS (
-                            SELECT 1 FROM cards WHERE deck_id = %s AND front = %s AND back = %s
-                        )
-                        """,
-                        (deck_id, front, back, deck_id, front, back)
-                    )
-                    if cur.rowcount == 1:
-                        inserted += 1
+                    cur.execute("SELECT id FROM decks WHERE name = %s AND owner_id IS NULL", (deck_name,))
+                    deck_row = cur.fetchone()
+                    if deck_row:
+                        deck_id = deck_row[0]
                     else:
-                        skipped += 1
+                        cur.execute(
+                            "INSERT INTO decks (name, owner_id) VALUES (%s, NULL) RETURNING id",
+                            (deck_name,)
+                        )
+                        deck_id = cur.fetchone()[0]
 
-            with conn.cursor() as cur:
-                cur.execute("SELECT set_config('app.current_user_id', '', false)")
+                    for front, back in cards:
+                        cur.execute(
+                            """
+                            INSERT INTO cards (deck_id, front, back)
+                            SELECT %s, %s, %s
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM cards WHERE deck_id = %s AND front = %s AND back = %s
+                            )
+                            """,
+                            (deck_id, front, back, deck_id, front, back)
+                        )
+                        if cur.rowcount == 1:
+                            inserted += 1
+                        else:
+                            skipped += 1
+
+            run_in_user_transaction(current_user["id"], do_import_shared)
         except Exception as ex:
             csv_status.value = f"Import failed: {ex}"
             csv_status.color = "#fca5a5"
@@ -1083,22 +1164,48 @@ def main(page: ft.Page):
         text_style=ft.TextStyle(size=15)
     )
     csv_status = ft.Text("", size=12, color="#94a3b8")
+    import_loading = ft.Container(
+        content=ft.Column([
+            ft.Text("Importing...", size=12, color="#94a3b8", text_align="center"),
+            ft.ProgressBar(value=None, width=380, color="#38bdf8", bgcolor="#1e293b")
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=6),
+        visible=False
+    )
 
     pending_cards = []
     pending_has_header = None
+    pending_upload_targets = {}
+    pending_source_path = None
 
     def show_csv_preview_dialog(card_rows, has_header):
-        preview_count = min(5, len(card_rows))
+        preview_count = min(10, len(card_rows))
         preview_rows = card_rows[:preview_count]
         header_note = "Header detected" if has_header else "No header detected"
 
-        preview_lines = [f"{i + 1}. {front}  ->  {back}" for i, (front, back) in enumerate(preview_rows)]
-        preview_text = "\n".join(preview_lines) if preview_lines else "(No rows)"
+        table_rows = [
+            ft.DataRow(
+                cells=[
+                    ft.DataCell(ft.Text(str(i + 1), size=12, color="#94a3b8")),
+                    ft.DataCell(ft.Text(front, size=13, color="#e2e8f0")),
+                    ft.DataCell(ft.Text(back, size=13, color="#e2e8f0"))
+                ]
+            )
+            for i, (front, back) in enumerate(preview_rows)
+        ]
 
-        def do_import(e):
-            dlg.open = False
-            page.update()
-            import_shared_deck_cards(card_rows, has_header)
+        preview_table = ft.DataTable(
+            columns=[
+                ft.DataColumn(ft.Text("#", size=12, color="#94a3b8")),
+                ft.DataColumn(ft.Text("German", size=12, weight="bold", color="#93c5fd")),
+                ft.DataColumn(ft.Text("English", size=12, weight="bold", color="#86efac"))
+            ],
+            rows=table_rows,
+            heading_row_color="#1e293b",
+            data_row_min_height=40,
+            data_row_max_height=48,
+            divider_thickness=0.3,
+            column_spacing=22
+        )
 
         def cancel_import(e):
             dlg.open = False
@@ -1111,11 +1218,20 @@ def main(page: ft.Page):
                 ft.Text(f"Rows detected: {len(card_rows)}"),
                 ft.Text(header_note, size=12, color="#94a3b8"),
                 ft.Text("Preview (first rows):", size=12, color="#94a3b8"),
-                ft.Text(preview_text, size=12)
-            ], tight=True),
+                ft.Container(
+                    content=ft.Column([
+                        preview_table
+                    ], scroll=ft.ScrollMode.AUTO),
+                    bgcolor="#0b1220",
+                    border=ft.Border.all(1, "#334155"),
+                    border_radius=10,
+                    padding=10,
+                    width=640,
+                    height=340
+                )
+            ], tight=True, spacing=8),
             actions=[
-                ft.TextButton("Cancel", on_click=cancel_import),
-                ft.TextButton("Import", on_click=do_import)
+                ft.TextButton("Close", on_click=cancel_import)
             ]
         )
         page.overlay.append(dlg)
@@ -1124,7 +1240,7 @@ def main(page: ft.Page):
 
     txt_csv_path = ft.TextField(
         label="CSV File Path",
-        width=450,
+        expand=True,
         height=60,
         border_radius=12,
         border_color="#334155",
@@ -1133,11 +1249,11 @@ def main(page: ft.Page):
         text_style=ft.TextStyle(size=15)
     )
 
-    def import_csv_from_path(e):
-        nonlocal pending_cards, pending_has_header
+    def preview_csv_data(e):
+        nonlocal pending_cards, pending_has_header, pending_source_path
         file_path = txt_csv_path.value.strip() if txt_csv_path.value else ""
         if not file_path:
-            csv_status.value = "Please enter a CSV file path."
+            csv_status.value = "Please enter a CSV file path or use Browse first."
             csv_status.color = "#fca5a5"
             page.update()
             return
@@ -1149,13 +1265,203 @@ def main(page: ft.Page):
         cards, has_header = read_cards_from_csv(file_path)
         pending_cards = cards
         pending_has_header = has_header
+        pending_source_path = file_path
         if not cards:
             csv_status.value = "No valid rows found in CSV."
             csv_status.color = "#fca5a5"
             page.update()
             return
+        csv_status.value = f"Preview ready: {len(cards)} rows. If correct, click IMPORT CSV."
+        csv_status.color = "#86efac"
+        page.update()
         show_csv_preview_dialog(pending_cards, pending_has_header)
+
+    def import_csv_from_path(e):
+        nonlocal pending_cards, pending_has_header
+        if not pending_cards:
+            csv_status.value = "Please click Preview first, then Import CSV."
+            csv_status.color = "#fca5a5"
+            page.update()
+            return
+
+        cards_to_import = list(pending_cards)
+        has_header_value = pending_has_header
+        page.run_task(import_csv_async, cards_to_import, has_header_value)
+
+    async def import_csv_async(cards, has_header):
+        import_loading.visible = True
+        csv_status.value = "Importing CSV..."
+        csv_status.color = "#94a3b8"
+        page.update()
+
+        await asyncio.sleep(0.1)
+        start_time = time.time()
+        try:
+            import_shared_deck_cards(cards, has_header)
+            elapsed = time.time() - start_time
+            if elapsed < 0.35:
+                await asyncio.sleep(0.35 - elapsed)
+        finally:
+            import_loading.visible = False
+            page.update()
+
+    def on_csv_upload(e):
+        nonlocal pending_cards, pending_has_header, pending_source_path
+
+        if e.error:
+            csv_status.value = f"Upload failed: {e.error}"
+            csv_status.color = "#fca5a5"
+            page.update()
+            return
+
+        if e.progress is not None and e.progress < 1:
+            csv_status.value = f"Uploading CSV... {int(e.progress * 100)}%"
+            csv_status.color = "#94a3b8"
+            page.update()
+            return
+
+        target_rel_path = pending_upload_targets.pop(e.file_name, None)
+        if not target_rel_path:
+            csv_status.value = "Upload completed but file target was not found."
+            csv_status.color = "#fca5a5"
+            page.update()
+            return
+
+        upload_base_dir = os.getenv("FLET_UPLOAD_DIR", "")
+        normalized_rel_path = target_rel_path.replace("/", os.sep)
+        candidates = [
+            os.path.join(upload_base_dir, normalized_rel_path) if upload_base_dir else None,
+            os.path.join(upload_base_dir, e.file_name.replace("/", os.sep)) if upload_base_dir and e.file_name else None,
+            os.path.join(os.getcwd(), "uploads", normalized_rel_path),
+            os.path.join(os.getcwd(), normalized_rel_path),
+            normalized_rel_path,
+            e.file_name.replace("/", os.sep) if e.file_name else None
+        ]
+
+        uploaded_path = next((path for path in candidates if path and os.path.exists(path)), None)
+        if not uploaded_path:
+            csv_status.value = "Upload completed but uploaded file could not be found on server."
+            csv_status.color = "#fca5a5"
+            page.update()
+            return
+
+        try:
+            with open(uploaded_path, "r", encoding="utf-8-sig", newline="") as f:
+                csv_text = f.read()
+        except Exception as ex:
+            csv_status.value = f"Could not read uploaded file: {ex}"
+            csv_status.color = "#fca5a5"
+            page.update()
+            return
+
+        cards, has_header = read_cards_from_csv_text(csv_text)
+        pending_cards = cards
+        pending_has_header = has_header
+
+        if not cards:
+            csv_status.value = "No valid rows found in uploaded CSV."
+            csv_status.color = "#fca5a5"
+            page.update()
+            return
+
+        txt_csv_path.value = uploaded_path
+        pending_source_path = uploaded_path
+        csv_status.value = f"Upload complete: {len(cards)} rows. Click Preview, then Import CSV."
+        csv_status.color = "#86efac"
+        page.update()
+
+    csv_file_picker = ft.FilePicker(on_upload=on_csv_upload)
+    if hasattr(page, "services"):
+        page.services.append(csv_file_picker)
+    else:
+        page.overlay.append(csv_file_picker)
+
+    async def browse_csv_file(e):
+        selected_files = await csv_file_picker.pick_files(allow_multiple=False, allowed_extensions=["csv", "txt"])
+        if not selected_files:
+            csv_status.value = "No file selected."
+            csv_status.color = "#fca5a5"
+            page.update()
+            return
+
+        selected = selected_files[0]
+        file_path = getattr(selected, "path", None)
+
+        if file_path:
+            txt_csv_path.value = file_path
+            csv_status.value = f"Selected: {os.path.basename(file_path)}"
+            csv_status.color = "#94a3b8"
+            page.update()
+            return
+
+        file_id = getattr(selected, "id", None)
+        file_name = getattr(selected, "name", "upload.csv")
+        if file_id is None:
+            csv_status.value = "Could not access selected file. Try manual path input."
+            csv_status.color = "#fca5a5"
+            page.update()
+            return
+
+        safe_name = f"{int(time.time())}_{file_name}"
+        target_rel_path = f"csv_uploads/{safe_name}"
+        pending_upload_targets[file_name] = target_rel_path
+        pending_upload_targets[target_rel_path] = target_rel_path
+
+        try:
+            upload_url = page.get_upload_url(target_rel_path, 600)
+            csv_status.value = f"Uploading: {file_name}"
+            csv_status.color = "#94a3b8"
+            page.update()
+            await csv_file_picker.upload([
+                ft.FilePickerUploadFile(
+                    id=file_id,
+                    name=file_name,
+                    upload_url=upload_url
+                )
+            ])
+        except Exception as ex:
+            pending_upload_targets.pop(file_name, None)
+            csv_status.value = f"Upload start failed: {ex}"
+            csv_status.color = "#fca5a5"
+            page.update()
+
+    csv_browse_button = ft.Container(
+        content=ft.Row([
+            ft.Icon(ft.Icons.FOLDER_OPEN, color="white", size=18),
+            ft.Text("Browse", size=12, weight="bold", color="white")
+        ], spacing=6, alignment=ft.MainAxisAlignment.CENTER),
+        bgcolor="#2563eb",
+        padding=ft.Padding(left=14, right=14, top=12, bottom=12),
+        border_radius=12,
+        on_click=browse_csv_file,
+        ink=True,
+        tooltip="Browse CSV file"
+    )
+
+    csv_preview_button = ft.Container(
+        content=ft.Row([
+            ft.Icon(ft.Icons.VISIBILITY, color="white", size=18),
+            ft.Text("Preview", size=12, weight="bold", color="white")
+        ], spacing=6, alignment=ft.MainAxisAlignment.CENTER),
+        bgcolor="#0ea5e9",
+        padding=ft.Padding(left=14, right=14, top=12, bottom=12),
+        border_radius=12,
+        on_click=preview_csv_data,
+        ink=True,
+        tooltip="Preview CSV"
+    )
+
+    csv_path_row = ft.Row([
+        ft.Container(content=txt_csv_path, expand=True),
+        csv_browse_button,
+        csv_preview_button
+    ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER)
     
+    login_actions = ft.Row([
+        ft.Button("LOGIN", on_click=login, width=140, height=50, bgcolor="#2563eb"),
+        ft.Button("REGISTER", on_click=register, width=140, height=50, bgcolor="#475569")
+    ], alignment=ft.MainAxisAlignment.CENTER)
+
     # ERROR BANNER - GÖMÜLü, GARANTILI GÖRÜNÜR
     error_banner = ft.Container(
         content=ft.Text("", size=16, weight="bold", color="white", text_align="center"),
@@ -1175,10 +1481,7 @@ def main(page: ft.Page):
             txt_username, txt_password,
             register_status,
             ft.Container(height=20),
-            ft.Row([
-                ft.Button("LOGIN", on_click=login, width=140, height=50, bgcolor="#2563eb"),
-                ft.Button("REGISTER", on_click=register, width=140, height=50, bgcolor="#475569")
-            ], alignment=ft.MainAxisAlignment.CENTER)
+            login_actions
         ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER),
         alignment=ft.Alignment.CENTER, expand=True, visible=True
     )
@@ -1216,6 +1519,37 @@ def main(page: ft.Page):
         else:
             debug_info.visible = False
         page.update()
+
+    decks_left_column = ft.Column([
+        ft.Container(
+            content=ft.Row([
+                ft.Icon(ft.Icons.PUBLIC, color="#60a5fa", size=20),
+                ft.Text("Shared / Other Decks", size=16, weight="bold", color="#94a3b8")
+            ], spacing=8),
+            margin=ft.Margin(bottom=15, left=0, right=0, top=0)
+        ),
+        ft.Container(content=shared_decks_list, expand=True)
+    ], expand=True)
+
+    my_decks_panel = ft.Container(
+        expand=True,
+        content=ft.Column([
+            ft.Container(
+                content=ft.Row([
+                    ft.Icon(ft.Icons.PERSON, color="#a855f7", size=20),
+                    ft.Text("My Decks", size=16, weight="bold", color="#94a3b8")
+                ], spacing=8),
+                margin=ft.Margin(bottom=15, left=0, right=0, top=0)
+            ),
+            ft.Container(content=my_decks_list, expand=True)
+        ], expand=True)
+    )
+
+    decks_sections = ft.Column(
+        [decks_left_column, ft.Container(height=12), my_decks_panel],
+        spacing=0,
+        expand=True
+    )
     
     view_decks = ft.Column([
         ft.Container(
@@ -1255,33 +1589,8 @@ def main(page: ft.Page):
         ),
         ft.Divider(color="#334155", height=1),
         ft.Container(height=10),
-        ft.Row([
-            ft.Column([
-                ft.Container(
-                    content=ft.Row([
-                        ft.Icon(ft.Icons.PUBLIC, color="#60a5fa", size=20),
-                        ft.Text("Shared / Other Decks", size=16, weight="bold", color="#94a3b8")
-                    ], spacing=8),
-                    margin=ft.Margin(bottom=15, left=0, right=0, top=0)
-                ),
-                ft.Container(content=shared_decks_list, expand=True)
-            ], expand=True),
-            ft.Container(width=20),
-            ft.Container(
-                width=340,
-                content=ft.Column([
-                    ft.Container(
-                        content=ft.Row([
-                            ft.Icon(ft.Icons.PERSON, color="#a855f7", size=20),
-                            ft.Text("My Decks", size=16, weight="bold", color="#94a3b8")
-                        ], spacing=8),
-                        margin=ft.Margin(bottom=15, left=0, right=0, top=0)
-                    ),
-                    ft.Container(content=my_decks_list, expand=True)
-                ], expand=True)
-            )
-        ], alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.START, expand=True)
-    ], visible=True, expand=True)
+        decks_sections
+    ], visible=True, expand=True, scroll=ft.ScrollMode.AUTO)
 
     txt_front = ft.TextField(
         label="Front (German)",
@@ -1360,7 +1669,7 @@ def main(page: ft.Page):
             margin=ft.Margin(bottom=15, left=0, right=0, top=0)
         ),
         ft.Container(
-            content=txt_csv_path,
+            content=csv_path_row,
             margin=ft.Margin(bottom=10, left=0, right=0, top=0)
         ),
         ft.Container(
@@ -1391,8 +1700,11 @@ def main(page: ft.Page):
             animate=ft.Animation(200, "easeOut")
         ),
         ft.Container(height=10),
+        import_loading,
+        ft.Container(height=10),
+        ft.Container(height=40),
         csv_status
-    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, visible=False)
+    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, visible=False, expand=True, scroll=ft.ScrollMode.AUTO)
 
     # 3. GAME
     card_text = ft.Text("Ready?", size=40, weight="bold", text_align="center")
@@ -1490,7 +1802,7 @@ def main(page: ft.Page):
     # 4. ADMIN
     view_admin = ft.Container(
         content=ft.Column([
-            ft.Row([ft.Text("ADMIN PANEL", size=24, weight="bold", color="red"), ft.IconButton(ft.Icons.CLOSE, on_click=lambda e: switch_tab(0))]),
+            ft.Row([ft.Text("ADMIN PANEL", size=24, weight="bold", color="red")]),
             ft.Divider(),
             ft.Text("Registered Users:", size=16),
             admin_user_list
@@ -1498,50 +1810,76 @@ def main(page: ft.Page):
     )
 
     # --- NAVIGATION ---
+    nav_decks_icon = ft.Icon(ft.Icons.LAYERS, color="#60a5fa", size=28)
+    nav_add_icon = ft.Icon(ft.Icons.ADD_CIRCLE, color="#10b981", size=28)
+    nav_admin_icon = ft.Icon(ft.Icons.ADMIN_PANEL_SETTINGS, color="#ef4444", size=28)
+
+    nav_decks_btn = ft.Container(
+        content=nav_decks_icon,
+        padding=10,
+        border_radius=10,
+        on_click=lambda _: switch_tab(0),
+        tooltip="Decks",
+        ink=True,
+        animate=ft.Animation(200, "easeOut")
+    )
+
+    nav_add_btn = ft.Container(
+        content=nav_add_icon,
+        padding=10,
+        border_radius=10,
+        on_click=lambda _: switch_tab(1),
+        tooltip="Add Card",
+        ink=True,
+        animate=ft.Animation(200, "easeOut")
+    )
+
+    nav_admin_btn = ft.Container(
+        content=nav_admin_icon,
+        padding=10,
+        border_radius=10,
+        visible=False,
+        on_click=lambda _: switch_tab(3),
+        tooltip="Admin Panel",
+        ink=True,
+        animate=ft.Animation(200, "easeOut")
+    )
+
+    def update_nav_selection():
+        nav_decks_btn.bgcolor = "#334155" if current_tab_index == 0 else None
+        nav_add_btn.bgcolor = "#334155" if current_tab_index == 1 else None
+        nav_admin_btn.bgcolor = "#7f1d1d" if current_tab_index == 3 else None
+
+        nav_decks_icon.color = "#93c5fd" if current_tab_index == 0 else "#60a5fa"
+        nav_add_icon.color = "#34d399" if current_tab_index == 1 else "#10b981"
+        nav_admin_icon.color = "#fca5a5" if current_tab_index == 3 else "#ef4444"
+
     def switch_tab(index):
+        nonlocal current_tab_index
+        current_tab_index = index
         if index == 3:
-            app_layout.visible = False
+            app_layout.visible = True
             view_admin.visible = True
+            view_decks.visible = False
+            view_browser.visible = False
             load_admin_data()
         else:
             app_layout.visible = True
             view_admin.visible = False
             view_decks.visible = (index == 0)
             view_browser.visible = (index == 1)
-            if index == 0: load_decks()
-            if index == 1: load_decks()
+            if index == 0:
+                load_decks()
+            if index == 1:
+                load_decks()
+        update_nav_selection()
         page.update()
-
-    btn_admin_panel = ft.IconButton(
-        ft.Icons.ADMIN_PANEL_SETTINGS,
-        icon_color="#ef4444",
-        icon_size=28,
-        visible=False,
-        on_click=lambda e: switch_tab(3),
-        tooltip="Admin Panel"
-    )
     
     bottom_nav = ft.Container(
         content=ft.Row([
-            ft.Container(
-                content=ft.Icon(ft.Icons.LAYERS, color="#60a5fa", size=28),
-                padding=10,
-                border_radius=10,
-                on_click=lambda _: switch_tab(0),
-                tooltip="Decks",
-                ink=True,
-                animate=ft.Animation(200, "easeOut")
-            ),
-            ft.Container(
-                content=ft.Icon(ft.Icons.ADD_CIRCLE, color="#10b981", size=28),
-                padding=10,
-                border_radius=10,
-                on_click=lambda _: switch_tab(1),
-                tooltip="Add Card",
-                ink=True,
-                animate=ft.Animation(200, "easeOut")
-            ),
-            btn_admin_panel
+            nav_decks_btn,
+            nav_add_btn,
+            nav_admin_btn
         ], alignment=ft.MainAxisAlignment.SPACE_AROUND),
         bgcolor="#1e293b",
         padding=15,
@@ -1554,28 +1892,82 @@ def main(page: ft.Page):
         )
     )
 
-    view_manager = ft.Container(content=ft.Column([view_decks, view_browser]), padding=20, expand=True)
+    view_manager = ft.Container(content=ft.Column([view_decks, view_browser, view_admin]), padding=20, expand=True)
     app_layout = ft.Column([view_manager, bottom_nav], expand=True, visible=False)
 
-    page.add(ft.Stack([view_login, app_layout, view_admin, practice_view], expand=True))
+    def apply_responsive_layout():
+        viewport_width = page.width if page.width and page.width > 0 else 900
+        mobile_mode = page.platform in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS) or viewport_width < 700
+
+        page.padding = 8 if mobile_mode else 0
+
+        form_width = max(220, min(450, viewport_width - (28 if mobile_mode else 140)))
+        login_width = max(220, min(320, form_width))
+
+        txt_username.width = login_width
+        txt_password.width = login_width
+        rename_input.width = login_width
+        deck_dropdown.width = max(220, min(420, form_width))
+        txt_front.width = form_width
+        txt_back.width = form_width
+        txt_csv_path.width = None
+        txt_shared_deck_name.width = form_width
+
+        login_actions.wrap = mobile_mode
+        for button in login_actions.controls:
+            button.width = None if mobile_mode else 140
+
+        card_container.width = max(260, min(550, viewport_width - (24 if mobile_mode else 120)))
+        card_container.height = 280 if mobile_mode else 380
+
+        view_manager.padding = 10 if mobile_mode else 20
+        practice_view.padding = 12 if mobile_mode else 30
+        bottom_nav.padding = 10 if mobile_mode else 15
+
+        decks_left_column.width = form_width if mobile_mode else None
+        my_decks_panel.width = form_width if mobile_mode else None
+
+    def handle_resize(e):
+        apply_responsive_layout()
+        page.update()
+
+    page.on_resized = handle_resize
+    apply_responsive_layout()
+    update_nav_selection()
+
+    page.add(ft.Stack([view_login, app_layout, practice_view], expand=True))
 
 if __name__ == "__main__":
     # When deployed to Render (or other PaaS) the platform provides a PORT
     # environment variable and requires binding to 0.0.0.0 so external
     # clients can reach the server. Use that when available; otherwise
-    # fall back to ft.run() for local development.
+    # run in desktop mode for local development.
     try:
         port = int(os.environ.get("PORT", 0))
     except Exception:
         port = 0
 
-    if port:
-        # Start Flet app listening on all interfaces on the provided port.
-        # ft.app provides a simple way to specify host/port for deployments.
+    running_on_cloud = any([
+        os.environ.get("RENDER"),
+        os.environ.get("RAILWAY_ENVIRONMENT"),
+        os.environ.get("K_SERVICE"),
+        os.environ.get("DYNO"),
+        os.environ.get("WEBSITE_SITE_NAME")
+    ])
+    force_web_local = os.environ.get("FLET_FORCE_WEB") == "1"
+
+    if port and (running_on_cloud or force_web_local):
+        # Start web server mode listening on all interfaces.
+        # In local forced-web mode we never fall back to desktop window mode.
+        web_view = ft.AppView.FLET_APP_WEB if force_web_local else ft.AppView.WEB_BROWSER
         try:
-            ft.app(target=main, host="0.0.0.0", port=port)
+            ft.run(main, host="0.0.0.0", port=port, view=web_view)
         except Exception:
-            # If ft.app is not available in this flet version, fall back.
-            ft.run(main)
+            if force_web_local:
+                raise
+            ft.run(main, host="0.0.0.0", port=port)
     else:
-        ft.run(main)
+        try:
+            ft.run(main)
+        except Exception:
+            ft.run(main, view=ft.AppView.FLET_APP)
