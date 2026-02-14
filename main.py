@@ -1750,52 +1750,63 @@ def main(page: ft.Page):
             make_rating_button("Easy", "#3b82f6", "easy")
         ],
         spacing=12,
-        alignment=ft.MainAxisAlignment.CENTER
+        alignment=ft.MainAxisAlignment.CENTER,
+        wrap=True,
+        run_spacing=10
     )
-    practice_view = ft.Container(
-        content=ft.Column([
-            ft.Row([
-                ft.Container(
-                    content=ft.Icon(ft.Icons.ARROW_BACK, color="white", size=24),
-                    bgcolor="#334155",
-                    border_radius=10,
-                    padding=10,
-                    on_click=stop_practice,
-                    ink=True,
-                    tooltip="Back to Decks"
-                ),
-                ft.Text("Practice Mode", size=22, weight="bold", color="#f1f5f9")
-            ], spacing=15),
-            ft.Container(height=30),
-            card_container,
-            ft.Container(height=12),
-            practice_status,
-            ft.Container(height=40),
-            rating_row,
-            ft.Container(height=24),
+
+    next_card_button = ft.Container(
+        content=ft.Row([
+            ft.Icon(ft.Icons.SKIP_NEXT, color="white", size=20),
+            ft.Text("NEXT CARD", size=15, weight="bold", color="white")
+        ], spacing=8, alignment=ft.MainAxisAlignment.CENTER),
+        bgcolor="#0d9488",
+        padding=ft.Padding(left=30, right=30, top=15, bottom=15),
+        border_radius=12,
+        on_click=get_next_card,
+        ink=True,
+        shadow=ft.BoxShadow(
+            spread_radius=1,
+            blur_radius=10,
+            color="#0d948866",
+            offset=ft.Offset(0, 4)
+        ),
+        animate=ft.Animation(200, "easeOut")
+    )
+
+    practice_gap_top = ft.Container(height=30)
+    practice_gap_before_rating = ft.Container(height=40)
+    practice_gap_before_next = ft.Container(height=24)
+
+    practice_content = ft.Column([
+        ft.Row([
             ft.Container(
-                content=ft.Row([
-                    ft.Icon(ft.Icons.SKIP_NEXT, color="white", size=20),
-                    ft.Text("NEXT CARD", size=15, weight="bold", color="white")
-                ], spacing=8, alignment=ft.MainAxisAlignment.CENTER),
-                bgcolor="#0d9488",
-                padding=ft.Padding(left=30, right=30, top=15, bottom=15),
-                border_radius=12,
-                on_click=get_next_card,
+                content=ft.Icon(ft.Icons.ARROW_BACK, color="white", size=24),
+                bgcolor="#334155",
+                border_radius=10,
+                padding=10,
+                on_click=stop_practice,
                 ink=True,
-                shadow=ft.BoxShadow(
-                    spread_radius=1,
-                    blur_radius=10,
-                    color="#0d948866",
-                    offset=ft.Offset(0, 4)
-                ),
-                animate=ft.Animation(200, "easeOut")
-            )
-        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                tooltip="Back to Decks"
+            ),
+            ft.Text("Practice Mode", size=22, weight="bold", color="#f1f5f9")
+        ], spacing=15),
+        practice_gap_top,
+        card_container,
+        ft.Container(height=12),
+        practice_status,
+        practice_gap_before_rating,
+        rating_row,
+        practice_gap_before_next,
+        next_card_button
+    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+
+    practice_view = ft.Container(
+        content=practice_content,
         visible=False,
         bgcolor="#0f172a",
         expand=True,
-        alignment=ft.Alignment.CENTER,
+        alignment=ft.Alignment(0, -1),
         padding=30
     )
 
@@ -1897,6 +1908,7 @@ def main(page: ft.Page):
 
     def apply_responsive_layout():
         viewport_width = page.width if page.width and page.width > 0 else 900
+        viewport_height = page.height if page.height and page.height > 0 else 700
         mobile_mode = page.platform in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS) or viewport_width < 700
 
         page.padding = 8 if mobile_mode else 0
@@ -1917,12 +1929,30 @@ def main(page: ft.Page):
         for button in login_actions.controls:
             button.width = None if mobile_mode else 140
 
-        card_container.width = max(260, min(550, viewport_width - (24 if mobile_mode else 120)))
-        card_container.height = 280 if mobile_mode else 380
+        card_container.width = max(240, min(550, viewport_width - (24 if mobile_mode else 120)))
+        if mobile_mode:
+            card_container.height = max(130, min(190, viewport_height - 460))
+            card_text.size = 34
+            practice_gap_top.height = 8
+            practice_gap_before_rating.height = 8
+            practice_gap_before_next.height = 6
+        else:
+            card_container.height = 380
+            card_text.size = 40
+            practice_gap_top.height = 30
+            practice_gap_before_rating.height = 40
+            practice_gap_before_next.height = 24
 
         view_manager.padding = 10 if mobile_mode else 20
-        practice_view.padding = 12 if mobile_mode else 30
+        practice_view.padding = 8 if mobile_mode else 30
         bottom_nav.padding = 10 if mobile_mode else 15
+        rating_row.spacing = 6 if mobile_mode else 12
+        rating_row.run_spacing = 6 if mobile_mode else 10
+        next_card_button.padding = ft.Padding(left=18, right=18, top=12, bottom=12) if mobile_mode else ft.Padding(left=30, right=30, top=15, bottom=15)
+        practice_content.spacing = 2 if mobile_mode else 0
+
+        for rating_button in rating_row.controls:
+            rating_button.padding = ft.Padding(left=12, right=12, top=8, bottom=8) if mobile_mode else ft.Padding(left=16, right=16, top=10, bottom=10)
 
         decks_left_column.width = form_width if mobile_mode else None
         my_decks_panel.width = form_width if mobile_mode else None
