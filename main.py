@@ -6,8 +6,9 @@ import psycopg2
 import bcrypt
 import os
 import time
-from datetime import date, timedelta
 from dotenv import load_dotenv
+from db_config import build_db_config
+from scheduling import calculate_schedule
 
 # Load environment variables from .env file
 load_dotenv()
@@ -19,25 +20,31 @@ def main(page: ft.Page):
     page.bgcolor = "#0f172a"
     page.padding = 0
 
+    raw_page_update = page.update
+
+    def safe_page_update(*args, **kwargs):
+        try:
+            raw_page_update(*args, **kwargs)
+        except Exception as ex:
+            msg = str(ex)
+            if "put_nowait" in msg or "session" in msg.lower() or "connection" in msg.lower():
+                print(f"[WARN] Skipped page.update after disconnect: {ex}")
+                return
+            raise
+
+    page.update = safe_page_update
+
     is_mobile_platform = page.platform in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS)
-    if not is_mobile_platform:
+    is_web_session = bool(getattr(page, "web", False))
+    if not is_mobile_platform and not is_web_session:
         page.window_width = 900
         page.window_height = 700
 
     # --- SUPABASE BAĞLANTISI (Secure Configuration) ---
-    db_config = {
-        "host": os.getenv("DB_HOST", "aws-0-eu-central-1.pooler.supabase.com"),
-        "database": os.getenv("DB_NAME", "postgres"),
-        "user": os.getenv("DB_USER", "postgres.djtryoqdcywczxtyvomw"),
-        "password": os.getenv("DB_PASSWORD"),
-        "port": os.getenv("DB_PORT", "6543"),
-        "sslmode": "require",
-        "connect_timeout": 10
-    }
-
-    # Check if password is set
-    if not db_config["password"]:
-        error_msg = "ERROR: Database password not found. Please create a .env file with DB_PASSWORD set."
+    try:
+        db_config = build_db_config()
+    except ValueError as ex:
+        error_msg = f"ERROR: {ex}. Please create/update your .env file."
         page.add(ft.Text(error_msg, color="red", size=16))
         print(error_msg)
         return
@@ -119,6 +126,28 @@ def main(page: ft.Page):
                 ALTER COLUMN repetitions SET DEFAULT 0,
                 ALTER COLUMN next_due SET DEFAULT CURRENT_DATE;
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS review_events (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id),
+                card_id INTEGER REFERENCES cards(id) ON DELETE CASCADE,
+                deck_id INTEGER REFERENCES decks(id) ON DELETE CASCADE,
+                grade TEXT NOT NULL,
+                reviewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_review_events_user_day
+            ON review_events (user_id, reviewed_at DESC);
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cards_deck_due
+            ON cards (deck_id, next_due);
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_review_events_user_deck_day
+            ON review_events (user_id, deck_id, reviewed_at DESC);
+        """)
         # Admin Kullanıcısı
         admin_user_id = None
         cursor.execute("SELECT id FROM users WHERE username = 'admin'")
@@ -191,6 +220,9 @@ def main(page: ft.Page):
     current_card = None
     is_showing_answer = False
     current_tab_index = 0
+    practice_due_start = 0
+    card_transition_token = 0
+    last_rating_action = None
 
     # --- UI REFERANSLARI ---
     shared_decks_list = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
@@ -371,6 +403,177 @@ def main(page: ft.Page):
             tooltip="Delete Deck"
         )
 
+    def copy_shared_deck_to_my_decks(shared_deck_id):
+        if not current_user:
+            page.snack_bar = ft.SnackBar(ft.Text("Please login to copy shared decks."))
+            page.snack_bar.open = True
+            page.update()
+            return
+
+        try:
+            source_deck = {"name": "", "owner_id": None}
+
+            def copy_shared_write():
+                with conn.cursor() as cur:
+                    cur.execute("SELECT name, owner_id FROM decks WHERE id = %s", (shared_deck_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        raise ValueError("Shared deck not found.")
+
+                    source_deck["name"] = row[0]
+                    source_deck["owner_id"] = row[1]
+
+                    if source_deck["owner_id"] is not None:
+                        raise ValueError("Only shared decks can be copied.")
+
+                    base_name = f"{source_deck['name']} (Copy)"
+                    candidate_name = base_name
+                    suffix = 2
+                    while True:
+                        cur.execute(
+                            "SELECT 1 FROM decks WHERE owner_id = %s AND name = %s",
+                            (current_user["id"], candidate_name)
+                        )
+                        if not cur.fetchone():
+                            break
+                        candidate_name = f"{base_name} {suffix}"
+                        suffix += 1
+
+                    cur.execute(
+                        "INSERT INTO decks (name, owner_id) VALUES (%s, %s) RETURNING id",
+                        (candidate_name, current_user["id"])
+                    )
+                    new_deck_id = cur.fetchone()[0]
+
+                    cur.execute(
+                        """
+                        INSERT INTO cards (deck_id, front, back, level, interval_days, ease_factor, repetitions, next_due)
+                        SELECT %s, front, back, COALESCE(level, 0), 1, 2.5, 0, CURRENT_DATE
+                        FROM cards
+                        WHERE deck_id = %s
+                        """,
+                        (new_deck_id, shared_deck_id)
+                    )
+
+            run_in_user_transaction(current_user["id"], copy_shared_write)
+            page.snack_bar = ft.SnackBar(ft.Text("Shared deck copied to your decks."))
+            page.snack_bar.open = True
+            load_decks()
+            page.update()
+        except Exception as ex:
+            page.snack_bar = ft.SnackBar(ft.Text(f"Could not copy shared deck: {ex}"))
+            page.snack_bar.open = True
+            page.update()
+
+    def make_copy_shared_button(did, dname, owner):
+        visible = bool(current_user and owner is None)
+
+        def on_copy_click(e):
+            copy_shared_deck_to_my_decks(did)
+
+        return ft.Container(
+            content=ft.Row([
+                ft.Icon(ft.Icons.CONTENT_COPY, color="white", size=16),
+                ft.Text("ADD TO MY DECK", size=11, weight="bold", color="white")
+            ], spacing=4, alignment=ft.MainAxisAlignment.CENTER),
+            bgcolor="#7c3aed",
+            padding=ft.Padding(left=10, right=10, top=8, bottom=8),
+            border_radius=8,
+            on_click=on_copy_click,
+            ink=True,
+            visible=visible,
+            tooltip=f"Copy '{dname}' to your own decks"
+        )
+
+    def load_learning_analytics():
+        if not current_user:
+            learning_analytics_panel.visible = False
+            return
+
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM decks WHERE owner_id = %s", (current_user["id"],))
+                total_decks = cur.fetchone()[0]
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM cards c
+                    JOIN decks d ON c.deck_id = d.id
+                    WHERE d.owner_id = %s
+                    """,
+                    (current_user["id"],)
+                )
+                total_cards = cur.fetchone()[0]
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM cards c
+                    JOIN decks d ON c.deck_id = d.id
+                    WHERE d.owner_id = %s
+                      AND COALESCE(c.next_due, CURRENT_DATE) <= CURRENT_DATE
+                    """,
+                    (current_user["id"],)
+                )
+                due_today = cur.fetchone()[0]
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM cards c
+                    JOIN decks d ON c.deck_id = d.id
+                    WHERE d.owner_id = %s
+                      AND COALESCE(c.interval_days, 1) >= 21
+                    """,
+                    (current_user["id"],)
+                )
+                mastered_cards = cur.fetchone()[0]
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*), COALESCE(SUM(CASE WHEN grade = 'easy' THEN 1 ELSE 0 END), 0)
+                    FROM review_events
+                    WHERE user_id = %s
+                      AND reviewed_at::date = CURRENT_DATE
+                    """,
+                    (current_user["id"],)
+                )
+                reviewed_today, easy_today = cur.fetchone()
+
+                cur.execute(
+                    """
+                    SELECT AVG(COALESCE(c.ease_factor, 2.5))
+                    FROM cards c
+                    JOIN decks d ON c.deck_id = d.id
+                    WHERE d.owner_id = %s
+                    """,
+                    (current_user["id"],)
+                )
+                avg_ease = cur.fetchone()[0]
+
+            easy_rate = 0 if reviewed_today == 0 else int(round((easy_today / reviewed_today) * 100))
+            avg_ease_text = "-" if avg_ease is None else f"{avg_ease:.2f}"
+
+            analytics_total_decks.value = str(total_decks)
+            analytics_total_cards.value = str(total_cards)
+            analytics_due_today.value = str(due_today)
+            analytics_reviewed_today.value = str(reviewed_today)
+            analytics_mastered.value = str(mastered_cards)
+            analytics_easy_rate.value = f"{easy_rate}%"
+            analytics_avg_ease.value = avg_ease_text
+            learning_analytics_panel.visible = True
+        except Exception as ex:
+            analytics_total_decks.value = "-"
+            analytics_total_cards.value = "-"
+            analytics_due_today.value = "-"
+            analytics_reviewed_today.value = "-"
+            analytics_mastered.value = "-"
+            analytics_easy_rate.value = "-"
+            analytics_avg_ease.value = "-"
+            learning_analytics_panel.visible = True
+            print(f"[analytics] Could not load analytics: {ex}")
+
     def load_decks():
         # Hover effect for deck cards
         def on_deck_hover(e, card):
@@ -396,14 +599,15 @@ def main(page: ft.Page):
         my_decks_list.controls.clear()
         options_owned = []
         with conn.cursor() as cur:
-            # Admins can see all decks. Normal users see shared + own decks.
+            # Show only shared decks + current user's own decks.
             if current_user and current_user.get('is_admin'):
                 cur.execute("""
                     SELECT d.id, d.name, d.owner_id, COUNT(c.id)
                     FROM decks d
                     LEFT JOIN cards c ON d.id = c.deck_id
+                    WHERE d.owner_id IS NULL OR d.owner_id = %s
                     GROUP BY d.id, d.name, d.owner_id ORDER BY d.id
-                """)
+                """, (current_user['id'],))
             elif current_user:
                 cur.execute("""
                     SELECT d.id, d.name, d.owner_id, COUNT(c.id)
@@ -434,21 +638,42 @@ def main(page: ft.Page):
                     label = f"{name} (Other)"
                     target_list = shared_decks_list
 
-                # Buttons: Play always; Rename/Delete via helper functions
+                can_play_deck = bool(current_user and owner_id is not None)
+
+                # Buttons
                 play_btn = ft.Container(
                     content=ft.Row([
                         ft.Icon(ft.Icons.PLAY_ARROW, color="white", size=20),
                         ft.Text("PLAY", size=14, weight="bold", color="white")
                     ], spacing=5, alignment=ft.MainAxisAlignment.CENTER),
-                    bgcolor="#0d9488",
+                    bgcolor="#0d9488" if can_play_deck else "#475569",
                     padding=ft.Padding(left=15, right=15, top=10, bottom=10),
                     border_radius=8,
                     on_click=lambda e, did=deck_id: start_practice(did),
-                    ink=True,
-                    animate=ft.Animation(200, "easeOut")
+                    ink=can_play_deck,
+                    animate=ft.Animation(200, "easeOut"),
+                    disabled=not can_play_deck,
+                    tooltip="Add shared deck to your own decks to play" if owner_id is None else "Play"
                 )
                 rename_btn = make_rename_button(deck_id, name, owner_id)
                 delete_btn = make_delete_button(deck_id, owner_id)
+                copy_btn = make_copy_shared_button(deck_id, name, owner_id)
+
+                if owner_id is None:
+                    action_controls = [
+                        copy_btn,
+                        ft.Container(expand=True),
+                        rename_btn,
+                        delete_btn,
+                    ]
+                else:
+                    action_controls = [
+                        play_btn,
+                        copy_btn,
+                        ft.Container(expand=True),
+                        rename_btn,
+                        delete_btn,
+                    ]
 
                 # Determine gradient colors based on deck type
                 if owner_id is None:
@@ -479,12 +704,7 @@ def main(page: ft.Page):
                             ft.Text(f"{count} Cards", size=13, color="#94a3b8")
                         ], spacing=5),
                         ft.Container(height=10),
-                        ft.Row([
-                            play_btn,
-                            ft.Container(expand=True),
-                            rename_btn,
-                            delete_btn
-                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
+                        ft.Row(action_controls, alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
                     ], spacing=0),
                     gradient=ft.LinearGradient(
                         begin=ft.Alignment(-1, -1),
@@ -522,85 +742,123 @@ def main(page: ft.Page):
             deck_dropdown.value = options_owned[0].key
         else:
             deck_dropdown.value = None
+        load_learning_analytics()
         page.update()
 
     # --- AUTH FONKSİYONLARI ---
-    def login(e):
+    def set_login_loading(is_loading, message="Signing in..."):
+        login_loading_text.value = message
+        login_loading.visible = is_loading
+        txt_username.disabled = is_loading
+        txt_password.disabled = is_loading
+        for ctrl in login_actions.controls:
+            ctrl.disabled = is_loading
+        page.update()
+
+    async def login_async(username, password):
         nonlocal current_user, current_tab_index
+        started = time.time()
+        set_login_loading(True, "Signing in...")
+        await asyncio.sleep(0)
+
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, username, password_hash, is_admin FROM users WHERE username = %s", (username,))
+                user = cur.fetchone()
+
+            if user:
+                stored_hash = user[2].encode('utf-8')
+                password_match = bcrypt.checkpw(password.encode('utf-8'), stored_hash)
+
+                if password_match:
+                    current_user = {"id": user[0], "username": user[1], "is_admin": user[3]}
+                    page.snack_bar = ft.SnackBar(ft.Text(f"Welcome, {current_user['username']}!"))
+                    page.snack_bar.open = True
+
+                    view_login.visible = False
+                    app_layout.visible = True
+                    if current_user['is_admin']:
+                        nav_admin_btn.visible = True
+                    else:
+                        nav_admin_btn.visible = False
+                    current_tab_index = 0
+                    update_nav_selection()
+                    try:
+                        with conn.cursor() as cur2:
+                            cur2.execute("SELECT set_config('app.current_user_id', %s, false)", (str(current_user['id']),))
+                    except Exception:
+                        pass
+                    load_decks()
+                    update_debug_info()
+                    page.update()
+                else:
+                    error_banner.content.value = "❌ Yanlış şifre!"
+                    error_banner.visible = True
+                    txt_password.error_text = "Yanlış şifre"
+                    page.update()
+            else:
+                error_banner.content.value = "❌ Kullanıcı bulunamadı!"
+                error_banner.visible = True
+                txt_username.error_text = "Kullanıcı bulunamadı"
+                page.update()
+        except Exception as ex:
+            error_banner.content.value = f"❌ Login error: {ex}"
+            error_banner.visible = True
+            page.update()
+        finally:
+            elapsed = time.time() - started
+            if elapsed < 0.25:
+                await asyncio.sleep(0.25 - elapsed)
+            set_login_loading(False)
+
+    def login(e):
         username = txt_username.value
         password = txt_password.value
-        
-        # Hataları sıfırla
+
         txt_username.error_text = ""
         txt_password.error_text = ""
         error_banner.visible = False
-
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, username, password_hash, is_admin FROM users WHERE username = %s", (username,))
-            user = cur.fetchone()
-        
-        if user:
-            stored_hash = user[2].encode('utf-8')
-            password_match = bcrypt.checkpw(password.encode('utf-8'), stored_hash)
-            
-            if password_match:
-                current_user = {"id": user[0], "username": user[1], "is_admin": user[3]}
-                page.snack_bar = ft.SnackBar(ft.Text(f"Welcome, {current_user['username']}!"))
-                page.snack_bar.open = True
-                
-                view_login.visible = False
-                app_layout.visible = True
-                if current_user['is_admin']:
-                    nav_admin_btn.visible = True
-                else:
-                    nav_admin_btn.visible = False
-                current_tab_index = 0
-                update_nav_selection()
-                try:
-                    with conn.cursor() as cur2:
-                        cur2.execute("SELECT set_config('app.current_user_id', %s, false)", (str(current_user['id']),))
-                except Exception:
-                    pass
-                load_decks()
-                update_debug_info()
-                page.update()
-            else:
-                # YANLIŞ ŞİFRE - KIRMIZI BANNER GÖSTER
-                error_banner.content.value = "❌ Yanlış şifre!"
-                error_banner.visible = True
-                txt_password.error_text = "Yanlış şifre"
-                page.update()
-        else:
-            # KULLANICIBULUNAMADI - KIRMIZI BANNER GÖSTER
-            error_banner.content.value = "❌ Kullanıcı bulunamadı!"
-            error_banner.visible = True
-            txt_username.error_text = "Kullanıcı bulunamadı"
-            page.update()
+        page.update()
+        page.run_task(login_async, username, password)
 
     # Use helper in auth.py so we can test registration programmatically
     from auth import create_user
 
-    def register(e):
-        username = txt_username.value
-        password = txt_password.value
+    async def register_async(username, password):
+        started = time.time()
+        set_login_loading(True, "Creating account...")
+        await asyncio.sleep(0)
+
         if not username or not password:
             register_status.value = "Please enter username and password"
             register_status.color = "#ef4444"
+            set_login_loading(False)
             page.update()
             return
 
-        success, msg = create_user(conn, username, password)
-        if success:
-            register_status.value = "Account created! Please login."
-            register_status.color = "#10b981"
-            page.snack_bar = ft.SnackBar(ft.Text("Account created! Please login."))
-            page.snack_bar.open = True
-        else:
-            register_status.value = msg
-            register_status.color = "#ef4444"
-            page.snack_bar = ft.SnackBar(ft.Text(msg))
-            page.snack_bar.open = True
-        page.update()
+        try:
+            success, msg = create_user(conn, username, password)
+            if success:
+                register_status.value = "Account created! Please login."
+                register_status.color = "#10b981"
+                page.snack_bar = ft.SnackBar(ft.Text("Account created! Please login."))
+                page.snack_bar.open = True
+            else:
+                register_status.value = msg
+                register_status.color = "#ef4444"
+                page.snack_bar = ft.SnackBar(ft.Text(msg))
+                page.snack_bar.open = True
+            page.update()
+        finally:
+            elapsed = time.time() - started
+            if elapsed < 0.25:
+                await asyncio.sleep(0.25 - elapsed)
+            set_login_loading(False)
+
+    def register(e):
+        username = txt_username.value
+        password = txt_password.value
+        page.run_task(register_async, username, password)
 
     def logout(e):
         nonlocal current_user, current_tab_index
@@ -610,6 +868,7 @@ def main(page: ft.Page):
         view_admin.visible = False
         view_login.visible = True
         nav_admin_btn.visible = False
+        learning_analytics_panel.visible = False
         update_nav_selection()
         txt_username.value = ""
         txt_password.value = ""
@@ -623,7 +882,7 @@ def main(page: ft.Page):
 
     # --- OYUN MANTIĞI ---
     def start_practice(deck_id):
-        nonlocal current_deck_id, current_deck_owner_id
+        nonlocal current_deck_id, current_deck_owner_id, practice_due_start, last_rating_action
         try:
             current_deck_id = int(deck_id)
         except Exception:
@@ -632,22 +891,106 @@ def main(page: ft.Page):
             cur.execute("SELECT owner_id FROM decks WHERE id = %s", (current_deck_id,))
             row = cur.fetchone()
             current_deck_owner_id = row[0] if row else None
+
+        if current_deck_owner_id is None:
+            page.snack_bar = ft.SnackBar(ft.Text("Shared decks cannot be played directly. Use 'Add to My Deck' first."))
+            page.snack_bar.open = True
+            page.update()
+            return
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM cards
+                WHERE deck_id = %s
+                  AND COALESCE(next_due, CURRENT_DATE) <= CURRENT_DATE
+                """,
+                (current_deck_id,)
+            )
+            practice_due_start = cur.fetchone()[0]
+
         view_manager.visible = False
         practice_view.visible = True
-        get_next_card()
+        last_rating_action = None
+        undo_rating_button.visible = False
+        update_today_focus_bar()
+        get_next_card(animate_transition=False)
         page.update()
 
     def stop_practice(e):
+        nonlocal last_rating_action
         view_manager.visible = True
         practice_view.visible = False
+        last_rating_action = None
+        undo_rating_button.visible = False
+        load_decks()
         page.update()
 
-    def get_next_card(e=None):
-        nonlocal current_card, is_showing_answer
+    def update_today_focus_bar():
+        if not current_user or not current_deck_id or current_deck_owner_id is None:
+            focus_due_value.value = "-"
+            focus_done_value.value = "-"
+            focus_remaining_value.value = "-"
+            return
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*)
+                     FROM cards
+                     WHERE deck_id = %s
+                       AND COALESCE(next_due, CURRENT_DATE) <= CURRENT_DATE) AS due_now,
+                    (SELECT COUNT(*)
+                     FROM review_events
+                     WHERE user_id = %s
+                       AND deck_id = %s
+                       AND reviewed_at::date = CURRENT_DATE) AS done_today
+                """,
+                (current_deck_id, current_user["id"], current_deck_id)
+            )
+            due_now, done_today = cur.fetchone()
+
+        focus_due_value.value = str(practice_due_start)
+        focus_done_value.value = str(done_today)
+        focus_remaining_value.value = str(due_now)
+
+    def get_next_card(e=None, animate_transition=True):
+        nonlocal current_card, is_showing_answer, card_transition_token
+        total_count = 0
+        due_count = 0
+        next_due_date = None
+
+        async def animate_card_transition(token, text_value, gradient_colors):
+            card_container.scale = 0.94
+            page.update()
+            await asyncio.sleep(0.03)
+            if token != card_transition_token:
+                return
+
+            card_text.value = text_value
+            card_container.gradient = ft.LinearGradient(
+                begin=ft.Alignment(-1, -1),
+                end=ft.Alignment(1, 1),
+                colors=gradient_colors
+            )
+            card_container.scale = 1.01
+            await asyncio.sleep(0.04)
+            if token != card_transition_token:
+                return
+
+            card_container.scale = 1.0
+            page.update()
+
+        def transition_card_to(text_value, gradient_colors):
+            nonlocal card_transition_token
+            card_transition_token += 1
+            page.run_task(animate_card_transition, card_transition_token, text_value, gradient_colors)
 
         def can_schedule_reviews():
             if current_deck_owner_id is None:
-                return current_user and current_user.get("is_admin")
+                return False
             if not current_user:
                 return False
             return current_user.get("is_admin") or current_user.get("id") == current_deck_owner_id
@@ -678,21 +1021,24 @@ def main(page: ft.Page):
             res = cur.fetchone()
 
             if can_schedule_reviews():
-                cur.execute("SELECT COUNT(*) FROM cards WHERE deck_id = %s", (current_deck_id,))
-                total_count = cur.fetchone()[0]
                 cur.execute(
-                    "SELECT COUNT(*) FROM cards WHERE deck_id = %s AND COALESCE(next_due, CURRENT_DATE) <= CURRENT_DATE",
+                    """
+                    SELECT
+                        COUNT(*) AS total_count,
+                        COUNT(*) FILTER (WHERE COALESCE(next_due, CURRENT_DATE) <= CURRENT_DATE) AS due_count,
+                        MIN(next_due) FILTER (WHERE next_due > CURRENT_DATE) AS next_due_date
+                    FROM cards
+                    WHERE deck_id = %s
+                    """,
                     (current_deck_id,)
                 )
-                due_count = cur.fetchone()[0]
+                counts_row = cur.fetchone()
+                total_count = counts_row[0] or 0
+                due_count = counts_row[1] or 0
+                next_due_date = counts_row[2]
                 if total_count == 0:
                     practice_status.value = "No cards in this deck."
                 elif due_count == 0:
-                    cur.execute(
-                        "SELECT MIN(next_due) FROM cards WHERE deck_id = %s",
-                        (current_deck_id,)
-                    )
-                    next_due_date = cur.fetchone()[0]
                     if next_due_date:
                         practice_status.value = f"All caught up. Next due: {next_due_date}"
                     else:
@@ -703,6 +1049,8 @@ def main(page: ft.Page):
             else:
                 practice_status.value = "Random mode (shared deck)"
                 practice_status.color = "#94a3b8"
+
+        update_today_focus_bar()
 
         if res:
             current_card = {
@@ -715,31 +1063,36 @@ def main(page: ft.Page):
                 "next_due": res[6]
             }
             is_showing_answer = False
-            card_text.value = current_card["front"]
-            card_container.gradient = ft.LinearGradient(
-                begin=ft.Alignment(-1, -1),
-                end=ft.Alignment(1, 1),
-                colors=["#1e3a8a", "#1e293b"]
-            )
-            card_container.scale = 1.0
-            page.update()
+            if animate_transition:
+                transition_card_to(current_card["front"], ["#1e3a8a", "#1e293b"])
+            else:
+                card_text.value = current_card["front"]
+                card_container.gradient = ft.LinearGradient(
+                    begin=ft.Alignment(-1, -1),
+                    end=ft.Alignment(1, 1),
+                    colors=["#1e3a8a", "#1e293b"]
+                )
+                card_container.scale = 1.0
+                page.update()
         else:
             current_card = None
             is_showing_answer = False
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM cards WHERE deck_id = %s", (current_deck_id,))
-                total_count = cur.fetchone()[0]
             if total_count == 0:
-                card_text.value = "No cards in this deck."
+                empty_text = "No cards in this deck."
             else:
-                card_text.value = "No cards due today."
+                empty_text = "No cards due today."
             practice_status.color = "#94a3b8"
-            card_container.gradient = ft.LinearGradient(
-                begin=ft.Alignment(-1, -1),
-                end=ft.Alignment(1, 1),
-                colors=["#0f172a", "#1e293b"]
-            )
-            page.update()
+            if animate_transition:
+                transition_card_to(empty_text, ["#0f172a", "#1e293b"])
+            else:
+                card_text.value = empty_text
+                card_container.gradient = ft.LinearGradient(
+                    begin=ft.Alignment(-1, -1),
+                    end=ft.Alignment(1, 1),
+                    colors=["#0f172a", "#1e293b"]
+                )
+                card_container.scale = 1.0
+                page.update()
 
     def flip_card(e):
         nonlocal is_showing_answer
@@ -766,39 +1119,30 @@ def main(page: ft.Page):
 
     def update_schedule(grade):
         if not current_card:
-            return False, "No card selected."
+            return False, "No card selected.", None, None
 
         if not current_user:
-            return False, "Login required."
+            return False, "Login required.", None, None
 
-        interval_days = int(current_card["interval_days"])
-        ease_factor = float(current_card["ease_factor"])
-        repetitions = int(current_card["repetitions"])
+        previous_state = {
+            "interval_days": int(current_card["interval_days"]),
+            "ease_factor": float(current_card["ease_factor"]),
+            "repetitions": int(current_card["repetitions"]),
+            "next_due": current_card["next_due"],
+        }
 
-        if grade == "again":
-            repetitions = 0
-            interval_days = 1
-        else:
-            repetitions += 1
-            if repetitions == 1:
-                interval_days = 1
-            elif repetitions == 2:
-                interval_days = 6
-            else:
-                interval_days = max(1, int(round(interval_days * ease_factor)))
-
-        delta = {
-            "again": -0.2,
-            "hard": -0.15,
-            "good": 0.0,
-            "easy": 0.15
-        }.get(grade, 0.0)
-        ease_factor = max(1.3, ease_factor + delta)
-
-        next_due = date.today() + timedelta(days=interval_days)
+        schedule = calculate_schedule(
+            interval_days=current_card["interval_days"],
+            ease_factor=current_card["ease_factor"],
+            repetitions=current_card["repetitions"],
+            grade=grade,
+        )
 
         try:
+            inserted_event_id = None
+
             def save_schedule():
+                nonlocal inserted_event_id
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -809,15 +1153,36 @@ def main(page: ft.Page):
                             next_due = %s
                         WHERE id = %s
                         """,
-                        (interval_days, ease_factor, repetitions, next_due, current_card["id"])
+                        (
+                            schedule["interval_days"],
+                            schedule["ease_factor"],
+                            schedule["repetitions"],
+                            schedule["next_due"],
+                            current_card["id"],
+                        )
                     )
+                    cur.execute(
+                        """
+                        INSERT INTO review_events (user_id, card_id, deck_id, grade)
+                        VALUES (%s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        (current_user["id"], current_card["id"], current_deck_id, grade)
+                    )
+                    inserted_event_id = cur.fetchone()[0]
 
             run_in_user_transaction(current_user["id"], save_schedule)
-            return True, "Saved"
+            undo_payload = {
+                "card_id": current_card["id"],
+                "event_id": inserted_event_id,
+                "previous": previous_state,
+            }
+            return True, "Saved", schedule, undo_payload
         except Exception as ex:
-            return False, f"Could not update review: {ex}"
+            return False, f"Could not update review: {ex}", None, None
 
     def rate_card(grade):
+        nonlocal last_rating_action
         if not current_card:
             practice_status.value = "No card to rate."
             practice_status.color = "#fca5a5"
@@ -834,30 +1199,29 @@ def main(page: ft.Page):
             return
 
         if current_deck_owner_id is None:
-            if not (current_user and current_user.get("is_admin")):
-                practice_status.value = "Rating disabled for shared decks."
-                practice_status.color = "#fca5a5"
-                page.snack_bar = ft.SnackBar(ft.Text("Spaced repetition is disabled for shared decks."))
-                page.snack_bar.open = True
-                page.update()
-                return
-        else:
-            if not current_user:
-                practice_status.value = "Login required to rate cards."
-                practice_status.color = "#fca5a5"
-                page.snack_bar = ft.SnackBar(ft.Text("Login required to rate cards."))
-                page.snack_bar.open = True
-                page.update()
-                return
-            if not (current_user.get("is_admin") or current_user.get("id") == current_deck_owner_id):
-                practice_status.value = "You can only rate your own decks."
-                practice_status.color = "#fca5a5"
-                page.snack_bar = ft.SnackBar(ft.Text("You can only rate cards in your own decks."))
-                page.snack_bar.open = True
-                page.update()
-                return
+            practice_status.value = "Shared decks cannot be rated directly."
+            practice_status.color = "#fca5a5"
+            page.snack_bar = ft.SnackBar(ft.Text("Use 'Add to My Deck' to study and rate this deck."))
+            page.snack_bar.open = True
+            page.update()
+            return
 
-        ok, msg = update_schedule(grade)
+        if not current_user:
+            practice_status.value = "Login required to rate cards."
+            practice_status.color = "#fca5a5"
+            page.snack_bar = ft.SnackBar(ft.Text("Login required to rate cards."))
+            page.snack_bar.open = True
+            page.update()
+            return
+        if not (current_user.get("is_admin") or current_user.get("id") == current_deck_owner_id):
+            practice_status.value = "You can only rate your own decks."
+            practice_status.color = "#fca5a5"
+            page.snack_bar = ft.SnackBar(ft.Text("You can only rate cards in your own decks."))
+            page.snack_bar.open = True
+            page.update()
+            return
+
+        ok, msg, schedule, undo_payload = update_schedule(grade)
         if not ok:
             practice_status.value = "Could not save rating."
             practice_status.color = "#fca5a5"
@@ -866,7 +1230,111 @@ def main(page: ft.Page):
             page.update()
             return
 
+        last_rating_action = undo_payload
+        undo_rating_button.visible = True
+
+        if schedule:
+            interval_days = schedule["interval_days"]
+            next_due = schedule["next_due"]
+            page.snack_bar = ft.SnackBar(
+                ft.Text(f"{grade.title()} saved • Next in {interval_days} day(s) ({next_due})")
+            )
+            page.snack_bar.open = True
+
+        # Keep rating loop fast; analytics panel refreshes when returning to decks.
+        update_today_focus_bar()
         get_next_card()
+
+    def undo_last_rating(e):
+        nonlocal last_rating_action, current_card, is_showing_answer
+
+        if not last_rating_action:
+            page.snack_bar = ft.SnackBar(ft.Text("No rating to undo."))
+            page.snack_bar.open = True
+            page.update()
+            return
+
+        if not current_user:
+            page.snack_bar = ft.SnackBar(ft.Text("Login required to undo rating."))
+            page.snack_bar.open = True
+            page.update()
+            return
+
+        try:
+            payload = last_rating_action
+            restored_card = None
+
+            def undo_write():
+                nonlocal restored_card
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE cards
+                        SET interval_days = %s,
+                            ease_factor = %s,
+                            repetitions = %s,
+                            next_due = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            payload["previous"]["interval_days"],
+                            payload["previous"]["ease_factor"],
+                            payload["previous"]["repetitions"],
+                            payload["previous"]["next_due"],
+                            payload["card_id"],
+                        )
+                    )
+                    if payload.get("event_id"):
+                        cur.execute(
+                            "DELETE FROM review_events WHERE id = %s AND user_id = %s",
+                            (payload["event_id"], current_user["id"])
+                        )
+                    cur.execute(
+                        """
+                        SELECT id, front, back, interval_days, ease_factor, repetitions, next_due
+                        FROM cards
+                        WHERE id = %s
+                        """,
+                        (payload["card_id"],)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        restored_card = {
+                            "id": row[0],
+                            "front": row[1],
+                            "back": row[2],
+                            "interval_days": row[3] or 1,
+                            "ease_factor": float(row[4] or 2.5),
+                            "repetitions": row[5] or 0,
+                            "next_due": row[6],
+                        }
+
+            run_in_user_transaction(current_user["id"], undo_write)
+            last_rating_action = None
+            undo_rating_button.visible = False
+            page.snack_bar = ft.SnackBar(ft.Text("Last rating undone."))
+            page.snack_bar.open = True
+            load_learning_analytics()
+            update_today_focus_bar()
+
+            if restored_card:
+                current_card = restored_card
+                is_showing_answer = False
+                card_text.value = restored_card["front"]
+                card_container.gradient = ft.LinearGradient(
+                    begin=ft.Alignment(-1, -1),
+                    end=ft.Alignment(1, 1),
+                    colors=["#1e3a8a", "#1e293b"]
+                )
+                card_container.scale = 1.0
+            else:
+                get_next_card()
+
+            page.update()
+        except Exception as ex:
+            page.snack_bar = ft.SnackBar(ft.Text(f"Could not undo rating: {ex}"))
+            page.snack_bar.open = True
+            page.update()
 
     def add_card_to_deck(e):
         if not current_user:
@@ -1462,6 +1930,17 @@ def main(page: ft.Page):
         ft.Button("REGISTER", on_click=register, width=140, height=50, bgcolor="#475569")
     ], alignment=ft.MainAxisAlignment.CENTER)
 
+    login_loading_text = ft.Text("Signing in...", size=12, color="#94a3b8", text_align="center")
+
+    login_loading = ft.Container(
+        visible=False,
+        width=300,
+        content=ft.Column([
+            login_loading_text,
+            ft.ProgressBar(value=None, width=280, color="#38bdf8", bgcolor="#1e293b")
+        ], spacing=6, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+    )
+
     # ERROR BANNER - GÖMÜLü, GARANTILI GÖRÜNÜR
     error_banner = ft.Container(
         content=ft.Text("", size=16, weight="bold", color="white", text_align="center"),
@@ -1481,7 +1960,9 @@ def main(page: ft.Page):
             txt_username, txt_password,
             register_status,
             ft.Container(height=20),
-            login_actions
+            login_actions,
+            ft.Container(height=10),
+            login_loading
         ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER),
         alignment=ft.Alignment.CENTER, expand=True, visible=True
     )
@@ -1509,6 +1990,85 @@ def main(page: ft.Page):
         margin=ft.Margin(bottom=10, left=0, right=0, top=0),
         visible=False,
         border=ft.Border.all(1, "#334155")
+    )
+
+    def create_analytics_stat(title, value_control, info_text):
+        def show_metric_help(e):
+            analytics_help_title.value = title
+            analytics_help_text.value = info_text
+            page.update()
+
+        return ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Text(title, size=11, color="#94a3b8", expand=True),
+                    ft.IconButton(
+                        icon=ft.Icons.INFO_OUTLINE,
+                        icon_size=13,
+                        icon_color="#94a3b8",
+                        tooltip="Metric info",
+                        on_click=show_metric_help,
+                        style=ft.ButtonStyle(padding=0),
+                    )
+                ], spacing=2),
+                value_control,
+            ], spacing=2),
+            bgcolor="#0b1220",
+            border=ft.Border.all(1, "#334155"),
+            border_radius=10,
+            padding=8,
+            width=126,
+            height=76,
+            shadow=ft.BoxShadow(
+                spread_radius=0,
+                blur_radius=8,
+                color="#00000033",
+                offset=ft.Offset(0, 2)
+            )
+        )
+
+    analytics_total_decks = ft.Text("0", size=18, weight="bold", color="#93c5fd")
+    analytics_total_cards = ft.Text("0", size=18, weight="bold", color="#86efac")
+    analytics_due_today = ft.Text("0", size=18, weight="bold", color="#facc15")
+    analytics_reviewed_today = ft.Text("0", size=18, weight="bold", color="#38bdf8")
+    analytics_mastered = ft.Text("0", size=18, weight="bold", color="#c4b5fd")
+    analytics_easy_rate = ft.Text("0%", size=18, weight="bold", color="#34d399")
+    analytics_avg_ease = ft.Text("-", size=18, weight="bold", color="#f9a8d4")
+    analytics_help_title = ft.Text("Metric Help", size=11, weight="bold", color="#cbd5e1")
+    analytics_help_text = ft.Text("Tap an info icon on any metric to see what it means.", size=11, color="#94a3b8")
+
+    learning_analytics_panel = ft.Container(
+        visible=False,
+        bgcolor="#1e293b",
+        border=ft.Border.all(1, "#334155"),
+        border_radius=12,
+        padding=10,
+        margin=ft.Margin(bottom=10, left=0, right=0, top=0),
+        content=ft.Column([
+            ft.Row([
+                ft.Icon(ft.Icons.INSIGHTS, color="#38bdf8", size=18),
+                ft.Text("My Learning Analytics", size=15, weight="bold", color="#e2e8f0")
+            ], spacing=8),
+            ft.Row([
+                create_analytics_stat("My Decks", analytics_total_decks, "Number of decks you own."),
+                create_analytics_stat("My Cards", analytics_total_cards, "Total cards inside your own decks."),
+                create_analytics_stat("Due Today", analytics_due_today, "Cards from your own decks scheduled for review today."),
+                create_analytics_stat("Reviewed Today", analytics_reviewed_today, "How many cards you rated today (Again/Hard/Good/Easy)."),
+                create_analytics_stat("Mastered (21d+)", analytics_mastered, "Cards with interval of 21 days or more in your decks."),
+                create_analytics_stat("Easy Rate Today", analytics_easy_rate, "Share of today's ratings marked as Easy."),
+                create_analytics_stat("Avg Ease", analytics_avg_ease, "Average ease factor of cards in your decks. Higher means easier overall.")
+            ], spacing=6, wrap=True, run_spacing=6),
+            ft.Container(
+                content=ft.Column([
+                    analytics_help_title,
+                    analytics_help_text
+                ], spacing=2),
+                bgcolor="#0b1220",
+                border=ft.Border.all(1, "#334155"),
+                border_radius=8,
+                padding=8
+            )
+        ], spacing=8)
     )
     
     def update_debug_info():
@@ -1571,6 +2131,7 @@ def main(page: ft.Page):
             margin=ft.Margin(bottom=15, left=0, right=0, top=0)
         ),
         debug_info,
+        learning_analytics_panel,
         ft.Container(
             content=ft.Row([
                 txt_new_deck,
@@ -1612,103 +2173,161 @@ def main(page: ft.Page):
         bgcolor="#1e293b",
         text_style=ft.TextStyle(size=15)
     )
-    view_browser = ft.Column([
-        ft.Container(
-            content=ft.Row([
-                ft.Icon(ft.Icons.ADD_CARD, color="#3b82f6", size=32),
-                ft.Text("ADD NEW CARD", size=26, weight="bold", color="#f1f5f9")
-            ], spacing=12, alignment=ft.MainAxisAlignment.CENTER),
-            margin=ft.Margin(bottom=30, left=0, right=0, top=0)
-        ),
-        ft.Container(
-            content=deck_dropdown,
-            bgcolor="#1e293b",
-            padding=15,
-            border_radius=12,
-            border=ft.Border.all(1, "#334155"),
-            margin=ft.Margin(bottom=20, left=0, right=0, top=0)
-        ),
-        ft.Container(
-            content=txt_front,
-            margin=ft.Margin(bottom=15, left=0, right=0, top=0)
-        ),
-        ft.Container(
-            content=txt_back,
-            margin=ft.Margin(bottom=30, left=0, right=0, top=0)
-        ),
-        ft.Container(
-            content=ft.Row([
-                ft.Icon(ft.Icons.CLOUD_UPLOAD, color="white", size=22),
-                ft.Text("SAVE TO CLOUD", size=16, weight="bold", color="white")
-            ], spacing=10, alignment=ft.MainAxisAlignment.CENTER),
-            bgcolor="#3b82f6",
-            padding=ft.Padding(left=40, right=40, top=18, bottom=18),
-            border_radius=12,
-            on_click=add_card_to_deck,
-            ink=True,
-            shadow=ft.BoxShadow(
-                spread_radius=1,
-                blur_radius=15,
-                color="#3b82f666",
-                offset=ft.Offset(0, 5)
+    add_card_panel = ft.Container(
+        content=ft.Column([
+            ft.Container(
+                content=ft.Row([
+                    ft.Icon(ft.Icons.ADD_CARD, color="#3b82f6", size=32),
+                    ft.Text("ADD NEW CARD", size=26, weight="bold", color="#f1f5f9")
+                ], spacing=12, alignment=ft.MainAxisAlignment.CENTER),
+                margin=ft.Margin(bottom=30, left=0, right=0, top=0)
             ),
-            animate=ft.Animation(200, "easeOut")
-        ),
-        ft.Container(height=25),
-        ft.Divider(color="#334155", height=1),
-        ft.Container(height=15),
-        ft.Container(
-            content=ft.Row([
-                ft.Icon(ft.Icons.UPLOAD_FILE, color="#38bdf8", size=28),
-                ft.Text("IMPORT SHARED DECK (ADMIN)", size=20, weight="bold", color="#f1f5f9")
-            ], spacing=10, alignment=ft.MainAxisAlignment.CENTER),
-            margin=ft.Margin(bottom=20, left=0, right=0, top=0)
-        ),
-        ft.Container(
-            content=txt_shared_deck_name,
-            margin=ft.Margin(bottom=15, left=0, right=0, top=0)
-        ),
-        ft.Container(
-            content=csv_path_row,
-            margin=ft.Margin(bottom=10, left=0, right=0, top=0)
-        ),
-        ft.Container(
-            content=ft.Text(
-                "CSV columns: German, English (header optional). If no header, first two columns are used.",
-                size=12,
-                color="#94a3b8",
-                text_align="center"
+            ft.Container(
+                content=deck_dropdown,
+                bgcolor="#1e293b",
+                padding=15,
+                border_radius=12,
+                border=ft.Border.all(1, "#334155"),
+                margin=ft.Margin(bottom=20, left=0, right=0, top=0)
             ),
-            margin=ft.Margin(bottom=10, left=0, right=0, top=0)
-        ),
-        ft.Container(
-            content=ft.Row([
-                ft.Icon(ft.Icons.CLOUD_UPLOAD, color="white", size=20),
-                ft.Text("IMPORT CSV", size=14, weight="bold", color="white")
-            ], spacing=8, alignment=ft.MainAxisAlignment.CENTER),
-            bgcolor="#0ea5e9",
-            padding=ft.Padding(left=30, right=30, top=14, bottom=14),
-            border_radius=12,
-            on_click=import_csv_from_path,
-            ink=True,
-            shadow=ft.BoxShadow(
-                spread_radius=1,
-                blur_radius=10,
-                color="#0ea5e966",
-                offset=ft.Offset(0, 4)
+            ft.Container(
+                content=txt_front,
+                margin=ft.Margin(bottom=15, left=0, right=0, top=0)
             ),
-            animate=ft.Animation(200, "easeOut")
-        ),
-        ft.Container(height=10),
-        import_loading,
-        ft.Container(height=10),
-        ft.Container(height=40),
-        csv_status
-    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, visible=False, expand=True, scroll=ft.ScrollMode.AUTO)
+            ft.Container(
+                content=txt_back,
+                margin=ft.Margin(bottom=30, left=0, right=0, top=0)
+            ),
+            ft.Container(
+                content=ft.Row([
+                    ft.Icon(ft.Icons.CLOUD_UPLOAD, color="white", size=22),
+                    ft.Text("SAVE TO CLOUD", size=16, weight="bold", color="white")
+                ], spacing=10, alignment=ft.MainAxisAlignment.CENTER),
+                bgcolor="#3b82f6",
+                padding=ft.Padding(left=40, right=40, top=18, bottom=18),
+                border_radius=12,
+                on_click=add_card_to_deck,
+                ink=True,
+                shadow=ft.BoxShadow(
+                    spread_radius=1,
+                    blur_radius=15,
+                    color="#3b82f666",
+                    offset=ft.Offset(0, 5)
+                ),
+                animate=ft.Animation(200, "easeOut")
+            )
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+        bgcolor="#111827",
+        border=ft.Border.all(1, "#334155"),
+        border_radius=16,
+        padding=20,
+        expand=True
+    )
+
+    import_csv_panel = ft.Container(
+        content=ft.Column([
+            ft.Container(
+                content=ft.Row([
+                    ft.Icon(ft.Icons.UPLOAD_FILE, color="#38bdf8", size=28),
+                    ft.Text("IMPORT SHARED DECK (ADMIN)", size=20, weight="bold", color="#f1f5f9")
+                ], spacing=10, alignment=ft.MainAxisAlignment.CENTER),
+                margin=ft.Margin(bottom=20, left=0, right=0, top=0)
+            ),
+            ft.Container(
+                content=txt_shared_deck_name,
+                margin=ft.Margin(bottom=15, left=0, right=0, top=0)
+            ),
+            ft.Container(
+                content=csv_path_row,
+                margin=ft.Margin(bottom=10, left=0, right=0, top=0)
+            ),
+            ft.Container(
+                content=ft.Text(
+                    "CSV columns: German, English (header optional). If no header, first two columns are used.",
+                    size=12,
+                    color="#94a3b8",
+                    text_align="center"
+                ),
+                margin=ft.Margin(bottom=10, left=0, right=0, top=0)
+            ),
+            ft.Container(
+                content=ft.Row([
+                    ft.Icon(ft.Icons.CLOUD_UPLOAD, color="white", size=20),
+                    ft.Text("IMPORT CSV", size=14, weight="bold", color="white")
+                ], spacing=8, alignment=ft.MainAxisAlignment.CENTER),
+                bgcolor="#0ea5e9",
+                padding=ft.Padding(left=30, right=30, top=14, bottom=14),
+                border_radius=12,
+                on_click=import_csv_from_path,
+                ink=True,
+                shadow=ft.BoxShadow(
+                    spread_radius=1,
+                    blur_radius=10,
+                    color="#0ea5e966",
+                    offset=ft.Offset(0, 4)
+                ),
+                animate=ft.Animation(200, "easeOut")
+            ),
+            ft.Container(height=10),
+            import_loading,
+            ft.Container(height=10),
+            csv_status
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+        bgcolor="#111827",
+        border=ft.Border.all(1, "#334155"),
+        border_radius=16,
+        padding=20,
+        expand=True
+    )
+
+    browser_panels_row = ft.ResponsiveRow(
+        [add_card_panel, import_csv_panel],
+        columns=12,
+        spacing=16,
+        run_spacing=16,
+        alignment=ft.MainAxisAlignment.CENTER,
+        vertical_alignment=ft.CrossAxisAlignment.START
+    )
+
+    view_browser = ft.Column(
+        [browser_panels_row],
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        visible=False,
+        expand=True,
+        scroll=ft.ScrollMode.AUTO
+    )
 
     # 3. GAME
     card_text = ft.Text("Ready?", size=40, weight="bold", text_align="center")
     practice_status = ft.Text("", size=14, color="#94a3b8")
+    focus_due_value = ft.Text("0", size=14, weight="bold", color="#facc15")
+    focus_done_value = ft.Text("0", size=14, weight="bold", color="#38bdf8")
+    focus_remaining_value = ft.Text("0", size=14, weight="bold", color="#10b981")
+
+    def make_focus_chip(label, value_control):
+        return ft.Container(
+            content=ft.Row([
+                ft.Text(label, size=11, color="#94a3b8"),
+                value_control,
+            ], spacing=6),
+            bgcolor="#0b1220",
+            border=ft.Border.all(1, "#334155"),
+            border_radius=8,
+            padding=ft.Padding(left=10, right=10, top=6, bottom=6),
+        )
+
+    today_focus_bar = ft.Container(
+        content=ft.Row([
+            make_focus_chip("Due", focus_due_value),
+            make_focus_chip("Done", focus_done_value),
+            make_focus_chip("Remaining", focus_remaining_value),
+        ], spacing=8, alignment=ft.MainAxisAlignment.CENTER, wrap=True),
+        bgcolor="#111827",
+        border=ft.Border.all(1, "#334155"),
+        border_radius=10,
+        padding=8,
+    )
+
     card_container = ft.Container(
         content=card_text,
         width=550,
@@ -1774,9 +2393,23 @@ def main(page: ft.Page):
         animate=ft.Animation(200, "easeOut")
     )
 
+    undo_rating_button = ft.Container(
+        content=ft.Row([
+            ft.Icon(ft.Icons.UNDO, color="white", size=18),
+            ft.Text("UNDO RATING", size=13, weight="bold", color="white")
+        ], spacing=8, alignment=ft.MainAxisAlignment.CENTER),
+        bgcolor="#7c3aed",
+        padding=ft.Padding(left=18, right=18, top=10, bottom=10),
+        border_radius=10,
+        on_click=undo_last_rating,
+        ink=True,
+        visible=False,
+        animate=ft.Animation(200, "easeOut")
+    )
+
     practice_gap_top = ft.Container(height=30)
     practice_gap_before_rating = ft.Container(height=40)
-    practice_gap_before_next = ft.Container(height=24)
+    practice_gap_before_next = ft.Container(height=8)
 
     practice_content = ft.Column([
         ft.Row([
@@ -1791,14 +2424,16 @@ def main(page: ft.Page):
             ),
             ft.Text("Practice Mode", size=22, weight="bold", color="#f1f5f9")
         ], spacing=15),
+        today_focus_bar,
         practice_gap_top,
         card_container,
         ft.Container(height=12),
         practice_status,
         practice_gap_before_rating,
         rating_row,
-        practice_gap_before_next,
-        next_card_button
+        ft.Container(height=8),
+        undo_rating_button,
+        practice_gap_before_next
     ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     practice_view = ft.Container(
@@ -1907,23 +2542,49 @@ def main(page: ft.Page):
     app_layout = ft.Column([view_manager, bottom_nav], expand=True, visible=False)
 
     def apply_responsive_layout():
-        viewport_width = page.width if page.width and page.width > 0 else 900
+        viewport_width = page.width if page.width and page.width > 0 else 390
         viewport_height = page.height if page.height and page.height > 0 else 700
         mobile_mode = page.platform in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS) or viewport_width < 700
+        browser_stack_mode = (
+            page.platform in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS)
+            or viewport_width < 980
+            or (viewport_height > viewport_width and viewport_width < 1200)
+        )
 
         page.padding = 8 if mobile_mode else 0
 
         form_width = max(220, min(450, viewport_width - (28 if mobile_mode else 140)))
         login_width = max(220, min(320, form_width))
+        panel_form_width = (
+            max(220, min(520, viewport_width - 72))
+            if browser_stack_mode
+            else max(220, min(420, (viewport_width - 150) // 2))
+        )
 
         txt_username.width = login_width
         txt_password.width = login_width
         rename_input.width = login_width
-        deck_dropdown.width = max(220, min(420, form_width))
-        txt_front.width = form_width
-        txt_back.width = form_width
+        deck_dropdown.width = max(220, min(420, panel_form_width))
+        txt_front.width = panel_form_width
+        txt_back.width = panel_form_width
         txt_csv_path.width = None
-        txt_shared_deck_name.width = form_width
+        txt_shared_deck_name.width = panel_form_width
+
+        csv_path_row.wrap = browser_stack_mode
+        csv_path_row.run_spacing = 8 if browser_stack_mode else 0
+
+        browser_panels_row.spacing = 12 if browser_stack_mode else 16
+        browser_panels_row.run_spacing = 16 if browser_stack_mode else 0
+        add_card_panel.col = {"xs": 12, "md": 12, "lg": 6} if browser_stack_mode else {"xs": 12, "md": 6, "lg": 6}
+        import_csv_panel.col = {"xs": 12, "md": 12, "lg": 6} if browser_stack_mode else {"xs": 12, "md": 6, "lg": 6}
+        add_card_panel.width = None
+        import_csv_panel.width = None
+        add_card_panel.padding = 14 if browser_stack_mode else 20
+        import_csv_panel.padding = 14 if browser_stack_mode else 20
+        add_card_panel.height = None if browser_stack_mode else 520
+        import_csv_panel.height = None if browser_stack_mode else 520
+        add_card_panel.expand = not browser_stack_mode
+        import_csv_panel.expand = not browser_stack_mode
 
         login_actions.wrap = mobile_mode
         for button in login_actions.controls:
@@ -1989,13 +2650,15 @@ if __name__ == "__main__":
     if port and (running_on_cloud or force_web_local):
         # Start web server mode listening on all interfaces.
         # In local forced-web mode we never fall back to desktop window mode.
-        web_view = ft.AppView.FLET_APP_WEB if force_web_local else ft.AppView.WEB_BROWSER
+        default_host = "127.0.0.1" if force_web_local else "0.0.0.0"
+        run_host = os.environ.get("FLET_WEB_HOST", default_host)
+        web_view = ft.AppView.WEB_BROWSER
         try:
-            ft.run(main, host="0.0.0.0", port=port, view=web_view)
+            ft.run(main, host=run_host, port=port, view=web_view)
         except Exception:
             if force_web_local:
                 raise
-            ft.run(main, host="0.0.0.0", port=port)
+            ft.run(main, host=run_host, port=port)
     else:
         try:
             ft.run(main)

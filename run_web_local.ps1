@@ -5,11 +5,23 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 
-$fletPath = Join-Path $PSScriptRoot "venv\Scripts\flet.exe"
-if (-not (Test-Path $fletPath)) {
-    Write-Host "flet.exe not found in venv\Scripts" -ForegroundColor Red
+$pythonPath = Join-Path $PSScriptRoot "venv\Scripts\python.exe"
+if (-not (Test-Path $pythonPath)) {
+    Write-Host "python.exe not found in venv\Scripts" -ForegroundColor Red
     exit 1
 }
+
+function Test-LocalClientConnected {
+    param(
+        [int]$Port
+    )
+
+    $connections = Get-NetTCPConnection -LocalPort $Port -State Established -ErrorAction SilentlyContinue |
+        Where-Object { $_.RemoteAddress -in @("127.0.0.1", "::1") }
+    return [bool]$connections
+}
+
+$hadOpenBrowserTab = Test-LocalClientConnected -Port 8550
 
 $existing = Get-NetTCPConnection -LocalPort 8550 -State Listen -ErrorAction SilentlyContinue
 if ($existing) {
@@ -21,9 +33,21 @@ if ($existing) {
     Start-Sleep -Milliseconds 300
 }
 
+$stalePython = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.CommandLine -and
+        $_.CommandLine -like "*main.py*" -and
+        $_.CommandLine -like "*$PSScriptRoot*"
+    }
+foreach ($proc in $stalePython) {
+    Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+    Write-Host "Stopped stale app process: $($proc.ProcessId)" -ForegroundColor Yellow
+}
+
 Write-Host "Starting Flet web mode on http://localhost:8550" -ForegroundColor Cyan
-if (Test-Path Env:PORT) { Remove-Item Env:PORT -ErrorAction SilentlyContinue }
-if (Test-Path Env:FLET_FORCE_WEB) { Remove-Item Env:FLET_FORCE_WEB -ErrorAction SilentlyContinue }
+$env:PORT = "8550"
+$env:FLET_FORCE_WEB = "1"
+$env:FLET_WEB_HOST = if ($Lan) { "0.0.0.0" } else { "127.0.0.1" }
 
 if (-not $env:FLET_SECRET_KEY -or [string]::IsNullOrWhiteSpace($env:FLET_SECRET_KEY)) {
     $env:FLET_SECRET_KEY = [Guid]::NewGuid().ToString("N")
@@ -37,8 +61,7 @@ if (-not (Test-Path $uploadDir)) {
 $env:FLET_UPLOAD_DIR = $uploadDir
 Write-Host "Upload dir: $uploadDir" -ForegroundColor DarkCyan
 
-$hostValue = if ($Lan) { "0.0.0.0" } else { "localhost" }
 $displayUrl = if ($Lan) { "http://<PC-IP>:8550" } else { "http://localhost:8550" }
 
 Write-Host "Web URL: $displayUrl" -ForegroundColor Green
-& $fletPath run main.py --web --port 8550 --host $hostValue --hidden
+& $pythonPath main.py
